@@ -1,6 +1,7 @@
 "use client";
 
 import { useMemo, useState } from "react";
+import { checkShotReference, type ReferenceCheck } from "../lib/reference-check";
 import { generatePrompts, type MetalColor, type ProductType, SHOTS } from "../lib/prompt-engine";
 
 const PRODUCT_TYPES: ProductType[] = [
@@ -25,17 +26,21 @@ export default function Home() {
   const [metal, setMetal] = useState<MetalColor>("Real Rose Gold");
   const [selectedShots, setSelectedShots] = useState<number[]>([1]);
   const [notes, setNotes] = useState("");
-  const [generated, setGenerated] = useState<{shot:number;prompt:string}[]>([]);
+  const [results, setResults] = useState<Array<{shot:number;prompt:string;status:string;imageUrl?:string;issues?:string[];reason?:string}>>([]);
+  const [running, setRunning] = useState(false);
+  const [error, setError] = useState("");
+
+  const checks = useMemo((): ReferenceCheck[] => selectedShots.map(shot =>
+    checkShotReference({
+      shot,
+      productType,
+      hasPrimaryReference: Boolean(reference),
+      hasWornOrScaleReference: Boolean(notes.trim()),
+      notes
+    })
+  ), [selectedShots, productType, reference, notes]);
 
   const allSelected = selectedShots.length === SHOTS.length;
-
-  const readiness = useMemo(() => {
-    if (!reference) return {state:"REQUIRED", text:"Upload the exact product reference before generation."};
-    if (selectedShots.some(s => s >= 7) && !notes.trim()) {
-      return {state:"LIMITED", text:"Worn/lifestyle shots may require scale or wearing references. Do not invent missing construction."};
-    }
-    return {state:"READY", text:"Core inputs are present. Shot-specific references remain subject to review."};
-  }, [reference, selectedShots, notes]);
 
   function toggleShot(id:number) {
     setSelectedShots(current =>
@@ -43,13 +48,48 @@ export default function Home() {
     );
   }
 
-  function generate() {
+  function fileToDataUrl(file: File): Promise<string> {
+    return new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onerror = () => reject(new Error("Could not read reference image."));
+      reader.onload = () => resolve(String(reader.result));
+      reader.readAsDataURL(file);
+    });
+  }
+
+  async function runPhotoshoot() {
     if (!reference || selectedShots.length===0) return;
-    setGenerated(generatePrompts({
-      productType, metal, selectedShots,
-      referenceName: reference.name,
-      additionalNotes: notes
-    }));
+    setRunning(true); setError("");
+    try {
+      const referenceDataUrl = await fileToDataUrl(reference);
+      const prompts = generatePrompts({productType, metal, selectedShots, referenceName:reference.name, additionalNotes:notes});
+      const initial = selectedShots.map(shot => {
+        const check = checks.find(x => x.shot===shot)!;
+        return {shot, prompt:prompts.find(x=>x.shot===shot)!.prompt, status:check.status==="REQUIRED"?"SKIPPED":"QUEUED", reason:check.reason};
+      });
+      setResults(initial);
+      for (const item of initial) {
+        if (item.status==="SKIPPED") continue;
+        setResults(current=>current.map(x=>x.shot===item.shot?{...x,status:"GENERATING"}:x));
+        const generation=await fetch("/api/generate",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({prompt:item.prompt,referenceDataUrl})});
+        const genData=await generation.json();
+        if(!generation.ok || !genData.imageUrl){
+          setResults(current=>current.map(x=>x.shot===item.shot?{...x,status:"ERROR",issues:[genData.error || "Generation failed."]}:x));
+          continue;
+        }
+        setResults(current=>current.map(x=>x.shot===item.shot?{...x,status:"VERIFYING",imageUrl:genData.imageUrl}:x));
+        const verification=await fetch("/api/verify",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({referenceDataUrl,generatedDataUrl:genData.imageUrl,prompt:item.prompt,productType,metal,shot:item.shot})});
+        const verifyData=await verification.json();
+        if(!verification.ok){
+          setResults(current=>current.map(x=>x.shot===item.shot?{...x,status:"REVIEW",issues:[verifyData.error || "Verification unavailable."]}:x));
+          continue;
+        }
+        const vr=verifyData.verification || {};
+        const status=["PASS","REVIEW","REJECT"].includes(vr.status)?vr.status:"REVIEW";
+        setResults(current=>current.map(x=>x.shot===item.shot?{...x,status,issues:Array.isArray(vr.issues)?vr.issues:[]}:x));
+      }
+    } catch(e) { setError(e instanceof Error ? e.message : "Photoshoot failed."); }
+    finally { setRunning(false); }
   }
 
   return (
@@ -67,7 +107,8 @@ export default function Home() {
         <div className="panel">
           <h2>01 · Reference</h2>
           <label className="upload">
-            <input type="file" accept="image/*" onChange={e=>setReference(e.target.files?.[0] ?? null)} />
+            <input type="file" accept="image/png,image/jpeg,image/webp" onChange={e=>setReference(e.target.files?.[0] ?? null)} />
+            {reference ? <img className="reference-preview" src={URL.createObjectURL(reference)} alt="Reference preview" /> : null}
             <strong>{reference ? reference.name : "Upload exact product image"}</strong>
             <small>CAD geometry is authoritative for design. Its rendered metal color is not the final metal authority.</small>
           </label>
@@ -99,54 +140,43 @@ export default function Home() {
         </div>
 
         <div className="shot-grid">
-          {SHOTS.map(shot=>(
-            <button
-              key={shot.id}
-              className={selectedShots.includes(shot.id) ? "shot active" : "shot"}
-              onClick={()=>toggleShot(shot.id)}
-            >
+          {SHOTS.map(shot=>{
+            const check=checks.find(x=>x.shot===shot.id);
+            return <button key={shot.id} className={selectedShots.includes(shot.id) ? "shot active" : "shot"} onClick={()=>toggleShot(shot.id)}>
               <span className="shot-num">P{String(shot.id).padStart(2,"0")}</span>
               <strong>{shot.title}</strong>
               <small>{shot.mode}</small>
-            </button>
-          ))}
+              <span className={"check "+(check?.status.toLowerCase()||"required")}>{check?.status}</span>
+            </button>;
+          })}
         </div>
       </section>
 
       <section className="panel">
         <h2>05 · Additional references / notes</h2>
-        <textarea
-          rows={4}
-          value={notes}
-          onChange={e=>setNotes(e.target.value)}
-          placeholder="Dimensions, trustworthy worn reference, attachment/chain details, or other documented constraints."
-        />
+        <textarea rows={4} value={notes} onChange={e=>setNotes(e.target.value)} placeholder="Documented dimensions, trustworthy worn reference details, attachment/chain details, or other confirmed information." />
+        <p>For worn/lifestyle shots, missing size or placement information is not guessed.</p>
       </section>
 
       <section className="status-bar">
-        <div><span className="status-label">{readiness.state}</span><span>{readiness.text}</span></div>
-        <button className="primary" disabled={!reference || selectedShots.length===0} onClick={generate}>
-          Build photoshoot prompts
-        </button>
+        <div><span className="status-label">{reference ? "READY" : "REQUIRED"}</span><span>{reference ? "Required shots will be skipped until their missing references are supplied." : "Upload the exact product reference before generation."}</span></div>
+        <button className="primary" disabled={!reference || selectedShots.length===0 || running} onClick={runPhotoshoot}>{running ? "Generating…" : "Generate & verify photoshoot"}</button>
       </section>
 
-      {generated.length>0 && (
-        <section className="panel">
-          <h2>Prompt output</h2>
-          <p>Generation-provider integration is the next adapter layer; these prompts are production-ready inputs.</p>
-          <div className="results">
-            {generated.map(item=>(
-              <article className="result" key={item.shot}>
-                <div className="result-head">
-                  <strong>P{String(item.shot).padStart(2,"0")}</strong>
-                  <span>READY FOR GENERATOR</span>
-                </div>
-                <pre>{item.prompt}</pre>
-              </article>
-            ))}
-          </div>
-        </section>
-      )}
+      {error ? <div className="error">{error}</div> : null}
+
+      {results.length>0 && <section className="panel">
+        <div className="panel-head"><div><h2>06 · Photoshoot results</h2><p>Generated images are checked against the original reference. Uncertain comparisons remain REVIEW.</p></div></div>
+        <div className="result-grid">
+          {results.map(item=><article className="result" key={item.shot}>
+            <div className="result-head"><strong>P{String(item.shot).padStart(2,"0")}</strong><span className={"result-status "+item.status.toLowerCase()}>{item.status}</span></div>
+            {item.imageUrl ? <img className="output-image" src={item.imageUrl} alt={"P"+String(item.shot).padStart(2,"0")+" result"} /> : null}
+            {item.reason ? <p className="result-reason">{item.reason}</p> : null}
+            {item.issues?.length ? <div className="issues">{item.issues.map((x,i)=><div key={i}>{x}</div>)}</div> : null}
+            <details><summary>View generation prompt</summary><pre>{item.prompt}</pre></details>
+          </article>)}
+        </div>
+      </section>}
     </main>
   );
 }
