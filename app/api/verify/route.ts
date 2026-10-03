@@ -25,12 +25,10 @@ function extractOutputText(data: any): string {
 }
 
 function parseJson(text: string) {
-  const fenced = text.match(/\`\`\`(?:json)?\\s*([\\s\\S]*?)\\s*\`\`\`/i);
-  const candidate = fenced ? fenced[1] : text;
-  const start = candidate.indexOf("{");
-  const end = candidate.lastIndexOf("}");
+  const start = text.indexOf("{");
+  const end = text.lastIndexOf("}");
   if (start === -1 || end === -1) throw new Error("Verifier did not return JSON.");
-  return JSON.parse(candidate.slice(start, end + 1));
+  return JSON.parse(text.slice(start, end + 1));
 }
 
 export async function POST(request: Request) {
@@ -55,7 +53,7 @@ export async function POST(request: Request) {
     "The user-selected real metal is authoritative for final metal appearance; the CAD/rendered source metal color is not authoritative.",
     "When evidence is uncertain, use REVIEW rather than PASS.",
     "Use REJECT for a clear product mismatch or invented construction.",
-    "Return JSON only:",
+    "Return JSON only in this shape:",
     '{"status":"PASS|REVIEW|REJECT","confidence":0,"issues":[],"checks":{"productIdentity":true,"geometry":true,"gemstones":true,"construction":true,"metal":true,"placement":true}}',
     "Evaluate product identity, silhouette, proportions, visible thickness, gemstone count/cut/size/position/spacing, prongs/settings, construction/attachments, selected metal appearance, scale, and wearing placement.",
     "Do not claim facts that cannot be verified from the images.",
